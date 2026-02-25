@@ -9,9 +9,26 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// --- CORS (mejorado) ---
+const allowedOrigins = (process.env.ALLOWED_ORIGIN ?? "*")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.ALLOWED_ORIGIN?.split(",") ?? "*",
+    origin: (origin, cb) => {
+      // requests sin origin (postman, server-to-server)
+      if (!origin) return cb(null, true);
+
+      // si pusiste "*" permitís todos
+      if (allowedOrigins.includes("*")) return cb(null, true);
+
+      // match exacto
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+
+      return cb(new Error(`CORS blocked for origin: ${origin}`));
+    },
   }),
 );
 
@@ -20,18 +37,29 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Memoria simple por sessionId (30 min)
 const memory = new NodeCache({ stdTTL: 60 * 30 });
 
-function buildSantaSystemPrompt() {
+// --- Config del personaje (por env) ---
+const PERSONA_NAME = process.env.PERSONA_NAME ?? "PíoPío AI";
+const PERSONA_STYLE =
+  process.env.PERSONA_STYLE ??
+  "Eres un pajarito tierno que responde con cariño, claridad y buena onda.";
+
+const MAX_SENTENCES = Number(process.env.MAX_SENTENCES ?? 2);
+const MAX_OUTPUT_TOKENS = Number(process.env.MAX_OUTPUT_TOKENS ?? 90);
+const MODEL = process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+
+function buildSystemPrompt() {
   return `
-You are Santa Claus.
-Rules:
-- Be friendly, playful and warm.
-- Keep responses short (max 2 sentences).
-- Write in the user's language (Spanish if user writes Spanish).
-- No markdown, output only the answer text.
+Eres ${PERSONA_NAME}.
+${PERSONA_STYLE}
+
+Reglas:
+- Sé breve: máximo ${MAX_SENTENCES} frases.
+- Tono: cálido, cercano, con toques tiernos (sin exagerar).
+- No uses markdown.
+- Devuelve solo el texto de la respuesta, sin comillas ni etiquetas.
 `.trim();
 }
 
-// --- 1) CHAT ---
 app.get("/chat", async (req, res) => {
   try {
     const message = String(req.query.message ?? "").trim();
@@ -40,25 +68,20 @@ app.get("/chat", async (req, res) => {
     if (!message) return res.status(400).json({ error: "Missing message" });
     if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
 
-    // Traer historial
     const history = memory.get(sessionId) ?? [];
-    // Guardar el user msg en historial
+
     const nextHistory = [...history, { role: "user", content: message }].slice(
       -12,
-    ); // limita memoria
+    );
 
     const response = await openai.responses.create({
-      model: "gpt-4.1-mini", // barato y bueno
-      input: [
-        { role: "system", content: buildSantaSystemPrompt() },
-        ...nextHistory,
-      ],
-      max_output_tokens: 80,
+      model: MODEL,
+      input: [{ role: "system", content: buildSystemPrompt() }, ...nextHistory],
+      max_output_tokens: MAX_OUTPUT_TOKENS,
     });
 
     const output = (response.output_text ?? "").trim();
 
-    // Guardar respuesta en memoria
     const updated = [
       ...nextHistory,
       { role: "assistant", content: output },
@@ -69,52 +92,6 @@ app.get("/chat", async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Chat failed" });
-  }
-});
-
-// --- 2) TTS (ElevenLabs) ---
-app.get("/tts", async (req, res) => {
-  try {
-    const text = String(req.query.message ?? "").trim();
-    if (!text) return res.status(400).json({ error: "Missing message" });
-
-    const apiKey = process.env.ELEVENLABS_API_KEY;
-    const voiceId = process.env.ELEVENLABS_VOICE_ID;
-
-    if (!apiKey || !voiceId) {
-      return res.status(500).json({ error: "Missing ElevenLabs config" });
-    }
-
-    const r = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": apiKey,
-          "Content-Type": "application/json",
-          Accept: "audio/mpeg",
-        },
-        body: JSON.stringify({
-          text,
-          model_id: "eleven_multilingual_v2",
-          voice_settings: { stability: 0.4, similarity_boost: 0.8 },
-        }),
-      },
-    );
-
-    if (!r.ok) {
-      const msg = await r.text();
-      console.error("ElevenLabs error:", msg);
-      return res.status(500).json({ error: "TTS failed" });
-    }
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-    const arrayBuffer = await r.arrayBuffer();
-    res.send(Buffer.from(arrayBuffer));
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "TTS failed" });
   }
 });
 
